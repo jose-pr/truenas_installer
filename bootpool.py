@@ -1,9 +1,11 @@
 from .diskutils import EFIVARS, Disk, Mount
-from .utils import Root, booted_as_uefi
+from .utils import booted_as_uefi
 from pathlib import Path
 
 from .zfs import Dataset, Pool, PoolBuilder
 from truenas_install import zfs
+
+KEYSOURCE_PROP = "org.zfsbootmenu:keysource"
 
 
 class BootPool(Pool):
@@ -58,7 +60,7 @@ class BootPool(Pool):
             builder.add_vdev(*vdev)
 
         pool = BootPool(builder.build(**run_args).name, root)
-        zroot =  Dataset(pool.name)
+        zroot = Dataset(pool.name)
 
         root_ds = pool.root_dataset
         root_ds.create(canmount="off", mountpoint="none")
@@ -69,12 +71,13 @@ class BootPool(Pool):
                 mnt = f"/etc/{keystore}"
             else:
                 keystore, mnt = encryption
-            ks = Dataset([pool.name, keystore])
-            ks.create(False, mountpoint=mnt)
-            zroot.set_props("org.zfsbootmenu:keysource", keystore)
+            zroot.set_props(KEYSOURCE_PROP, keystore)
+
+            keystore: Dataset = pool.keystore()
+            keystore.create(False, mountpoint=mnt)
             if passphrase:
                 zroot.set_props("keylocation", f"{mnt}/{pool.name}.key")
-                with ks as ks_root:
+                with keystore as ks_root:
                     (ks_root.path / f"{pool.name}.key").write_text(passphrase)
 
         return pool
@@ -84,12 +87,16 @@ class BootPool(Pool):
         if bootfs:
             return self.boot_enviroment(bootfs.split("/")[-1])
 
+    def keystore(self):
+        keystore = self.get_prop(KEYSOURCE_PROP, str)
+        if keystore:
+            return Dataset(keystore)
+
 
 class BootEnviroment(Dataset):
-    def __init__(self, pool: BootPool, name: str, base_mount="/mnt") -> None:
+    def __init__(self, pool: BootPool, name: str) -> None:
         self.pool = pool
         super().__init__([pool.root_dataset, name])
-        self.base_mount = Path(base_mount)
         self._mnts: "list[Mount]" = []
         for (dev, _mnt, ty) in [
             ("udev", "dev", "devtmpfs"),
@@ -106,31 +113,24 @@ class BootEnviroment(Dataset):
         return self.name.split("/")[-1]
 
     def keystore(self):
-        keystore = self.get_prop("org.zfsbootmenu:keysource", str)
+        keystore = self.get_prop(KEYSOURCE_PROP, str)
         if keystore:
             return Dataset(keystore)
 
     def mount(self, path: Path = None):
-        mnt = Path(path) or self.base_mount / self.pool.name / self.be_name
-        root = Root(super().mount(mnt).path)
+        chroot, path = super().mount(path)
         for m in self._mnts:
-            m.path = root.path / m.path.name
-            m.mount()
+            m.mount(chroot=self.chroot)
         keystore = self.keystore()
         if keystore:
-            root.run(zfs("mount", keystore.name))
-        return root
+            chroot.run(zfs("mount", keystore.name))
+        return chroot, path
 
-    def unmount(self, path: Path or None, mountpoint: str = None):
-        mnt = Path(path) or self.base_mount / self.pool.name / self.be_name
+    def unmount(self, check=True):
         keystore = self.keystore()
         if keystore:
-            Root(mnt).run(zfs("unmount", keystore.name))
+            self.chroot.run(zfs("unmount", keystore.name))
         for m in self._mnts:
-            if m.path.is_mount():
-                m.path = mnt / m.path.name
-                m.unmount()
-        super().unmount(mnt, mountpoint or "/")
+            m.unmount(True, chroot=self.chroot)
+        super().unmount(check)
 
-    def __enter__(self) -> Root:
-        return super().__enter__()

@@ -42,9 +42,12 @@ class PartitionType(str, Enum):
     def parse(uid: str):
         uid = uid.upper().strip()
         for t in PartitionType:
-            if t.id == uid or t.guid == uid:
+            if t == uid:
                 return t
         raise Exception(f"Unknown Partition Type: {uid}")
+
+    def __eq__(self, uid: object) -> bool:
+        return  self.id == uid or self.guid == uid
 
 class Mount:
     def __init__(

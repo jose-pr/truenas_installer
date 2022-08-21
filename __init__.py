@@ -9,12 +9,11 @@ import platform
 import shutil
 import json
 import subprocess
-import sys
 from typing import Literal
 
-from truenas_install.zfs import Dataset, zfs
+from truenas_install.zfs import zfs
 
-from .bootpool import BootEnviroment, BootPool
+from .bootpool import BootPool
 from .utils import (
     Command,
     Logger,
@@ -89,9 +88,7 @@ class TrueNASInstaller:
             if DiskUse.Bootloader in disk.use:
                 if (
                     next(
-                        disk.partitions(
-                            lambda p: p.get_guid() == PartitionType.BIOS.guid
-                        ),
+                        disk.partitions(lambda p: p.get_guid() == PartitionType.BIOS),
                         None,
                     )
                     == None
@@ -109,9 +106,7 @@ class TrueNASInstaller:
                 # Should be 2 on OS disks
                 if (
                     next(
-                        disk.partitions(
-                            lambda p: p.get_guid() == PartitionType.EFI.guid
-                        ),
+                        disk.partitions(lambda p: p.get_guid() == PartitionType.EFI),
                         None,
                     )
                     == None
@@ -124,7 +119,7 @@ class TrueNASInstaller:
                     self.swap
                     and next(
                         disk.partitions(
-                            lambda p: p.get_guid() == PartitionType.LinuxSwap.guid
+                            lambda p: p.get_guid() == PartitionType.LinuxSwap
                         ),
                         None,
                     )
@@ -138,9 +133,7 @@ class TrueNASInstaller:
 
                 if (
                     next(
-                        disk.partitions(
-                            lambda p: p.get_guid() == PartitionType.ZFS.guid
-                        ),
+                        disk.partitions(lambda p: p.get_guid() == PartitionType.ZFS),
                         None,
                     )
                     == None
@@ -163,7 +156,7 @@ class TrueNASInstaller:
 
     def create_bootpool(self):
         pool_members = [
-            next(disk.partitions(lambda p: p.get_guid() == PartitionType.ZFS.guid))
+            next(disk.partitions(lambda p: p.get_guid() == PartitionType.ZFS))
             for disk in self.disks
             if DiskUse.BootPool in disk.use
         ]
@@ -198,12 +191,12 @@ class TrueNASInstaller:
 
     def install_bootloader(self, format_efi: bool):
         bootfs = self.boot_pool.bootfs()
-        bootfs.base_mount = self.base_mount
-        with bootfs as chroot:
+        bootfs.chroot = Root(self.base_mount / bootfs.name)
+        with bootfs as (chroot, root):
             if booted_as_uefi():
                 # Clean up dumps from NVRAM to prevent
                 # "failed to register the EFI boot entry: No space left on device"
-                for item in chroot.path.joinpath(EFIVARS).iterdir():
+                for item in root.joinpath(EFIVARS).iterdir():
                     if item.name.startswith("dump-"):
                         with contextlib.suppress(Exception):
                             item.unlink()
@@ -213,15 +206,13 @@ class TrueNASInstaller:
                 partition = disk.get_partition(2)
                 if DiskUse.BootPool not in disk.use:
                     partition = next(
-                        disk.partitions(
-                            lambda p: p.get_guid() == PartitionType.EFI.guid
-                        ),
+                        disk.partitions(lambda p: p.get_guid() == PartitionType.EFI),
                         partition,
                     )
                 if partition == None:
                     self.logger.error(f"Couldnt find efi partition for disk {disk}")
                     continue
-                if format_efi or partition.get_guid() != PartitionType.EFI.guid:
+                if format_efi or partition.get_guid() != PartitionType.EFI:
                     Command(
                         "mkdosfs",
                         F=32,
@@ -230,7 +221,7 @@ class TrueNASInstaller:
                         _=partition.dev(),
                     ).run()
 
-                with Mount(partition.dev(), chroot.path / "boot/efi", "vfat") as efi:
+                with Mount(partition.dev(), root / "boot/efi", "vfat") as efi:
                     bootloader = efi / EFI_BOOTLOADER
                     bootloader.parent.mkdir(exist_ok=True)
                     if not bootloader.exists():
@@ -325,22 +316,21 @@ class TrueNASInstaller:
                     bootenv.name = probe_dataset_name
                     break
         bootenv.create(
-            mountpoint="/",
+            mountpoint="legacy",
             canmount="noauto",
             **{
                 "truenas:kernel_version": manifest["kernel_version"],
                 "zectl:keep": "False",
             },
         )
-        bootenv.base_mount = self.base_mount
+        bootenv.chroot = Root(self.base_mount / bootenv.name)
         try:
-
-            with bootenv as chroot:
-                self.logger.progress(0, "Extracting")
+            self.logger.progress(0, "Extracting")
+            with Mount(bootenv.name, bootenv.root, fs="zfs") as root:
                 try:
                     for progress in unsquashfs(
                         src / "rootfs.squashfs",
-                        chroot.path,
+                        root,
                         f=None,
                         da=16,
                         fr=16,
@@ -354,8 +344,9 @@ class TrueNASInstaller:
                         f"unsquashfs failed with exit code {e.returncode}: {e.output}"
                     )
                     raise
-
-                self.logger.progress(0.9, "Performing post-install tasks")
+            bootenv.set_props(mountpoint="/")
+            self.logger.progress(0.9, "Performing post-install tasks")
+            with bootenv as (chroot, root):
 
                 # We want to remove this for fresh installation + upgrade both
                 # In this case, /etc/machine-id would be treated as the valid
@@ -363,10 +354,11 @@ class TrueNASInstaller:
                 # systemd-machine-id-setup --print to confirm but just to be cautious
                 # we remove this as it will be generated automatically by systemd then
                 # complying with /etc/machine-id contents
-                (chroot.path / "var/lib/dbus/machine-id").unlink(missing_ok=True)
+                (root / "var/lib/dbus/machine-id").unlink(missing_ok=True)
 
                 is_freebsd_upgrade = False
                 setup_machine_id = configure_serial = False
+                conf = TruenasConf(root)
                 if preserved_data:
                     is_freebsd_upgrade = (
                         preserved_data / "bin/freebsd-version"
@@ -390,33 +382,33 @@ class TrueNASInstaller:
                             setup_machine_id = True
                     else:
                         paths.append("etc/machine-id")
-                    rsync.add_args(*rsync, _=f"{chroot.path}/").run(
+                    rsync.add_args(*rsync, _=f"{root}/").run(
                         cwd=preserved_data,
                     )
 
-                    (chroot.path / NEED_UPDATE_SENTINEL).touch()
+                    (root / NEED_UPDATE_SENTINEL).touch()
 
                     if is_freebsd_upgrade:
-                        (chroot.path / FREEBSD_UPDATE_SENTINEL).touch()
+                        (root / FREEBSD_UPDATE_SENTINEL).touch()
                     else:
-                        enable_system_user_services(chroot, preserved_data)
+                        conf.configure_serial_port()
                 else:
-                    Command("cp", "/etc/hostid", chroot.path / "etc/").run()
+                    Command("cp", "/etc/hostid", root / "etc/").run()
                     if not self.eula_accepted:
-                        (chroot.path / TRUENAS_EULA_PENDING_SENTINEL).touch()
-                    (chroot.path / FIRST_INSTALL_SENTINEL).touch()
+                        (root / TRUENAS_EULA_PENDING_SENTINEL).touch()
+                    (root / FIRST_INSTALL_SENTINEL).touch()
                     setup_machine_id = configure_serial = True
 
                 if setup_machine_id:
-                    (chroot.path / "/etc/machine-id").unlink(missing_ok=True)
-                    Command("systemd-machine-id-setup", root=chroot.path).run()
+                    (root / "/etc/machine-id").unlink(missing_ok=True)
+                    Command("systemd-machine-id-setup", root=root).run()
 
                 if IS_FREEBSD:
                     pass
                 else:
                     # Remove GRUB from fstab
                     fstab = (
-                        chroot.path
+                        root
                         / "usr/lib/python3/dist-packages/middlewared/etc_files/fstab.mako"
                     )
                     orig = fstab.read_text()
@@ -430,11 +422,9 @@ class TrueNASInstaller:
                             Command("/etc/netcli", "reset_root_pw", self.password)
                         )
 
-                    if sql:
-                        chroot.run(Command("sqlite3", FREENAS_DB), input=sql)
-
+                    conf.run_sql(sql)
                     if configure_serial:
-                        configure_serial_port(chroot, chroot / FREENAS_DB)
+                        conf.configure_serial_port()
 
                     self.boot_pool.set_props(bootfs=bootenv.name)
                     cp = chroot.run(
@@ -448,19 +438,19 @@ class TrueNASInstaller:
                         )
                     keystore = bootenv.keystore()
                     if keystore:
-                        keystore_mnt = keystore.get_prop("mountpoint", str)
-                        zol_conf = (
-                            chroot.path / "usr/share/initramfs-tools/hooks/keystore"
-                        )
-                        zol_conf.write_text(
+                        _mnt = keystore.get_prop('mountpoint', Path)
+                        if _mnt:
+                            key = _mnt / f"{self.boot_pool.name}.key"
+                            zol_conf = root / "usr/share/initramfs-tools/hooks/keystore"
+                            zol_conf.write_text(
                             f"""#!/bin/sh
-    mkdir -p "${{DESTDIR}}/{keystore_mnt}"
-    cp {keystore_mnt}/{self.boot_pool.name}.key "${{DESTDIR}}/{keystore_mnt}/{self.boot_pool.name}.key"
+    mkdir -p "${{DESTDIR}}/{key.parent}"
+    cp {key} "${{DESTDIR}}/{key}"
     exit 0
     """
                         )
-                        zol_conf.chmod(zol_conf.stat().st_mode | stat.S_IEXEC)
-                        chroot.run(Command("update-initramfs", k="all", u=None))
+                            zol_conf.chmod(zol_conf.stat().st_mode | stat.S_IEXEC)
+                            chroot.run(Command("update-initramfs", k="all", u=None))
         except Exception:
             if old_bootfs_prop != "-":
                 self.boot_pool.set_props(bootfs=old_bootfs_prop)
@@ -472,61 +462,77 @@ class TrueNASInstaller:
                 update_mnt.unmount()
 
 
-def dict_factory(cursor, row):
-    d = {}
+class TruenasDB:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def exists(self):
+        return self.path.exists()
+
+    def query(self, table: str, prefix: str = None):
+        if not self.exists():
+            return {}
+
+        with sqlite3.connect(self.path) as conn:
+            conn.row_factory = dict_factory
+            c = conn.cursor()
+            try:
+                c.execute(f"SELECT * FROM {table}")
+                result: "dict[str,str]" = c.fetchone()
+            finally:
+                c.close()
+            if prefix:
+                result = {k.replace(prefix, ""): v for k, v in result.items()}
+            return result
+
+class TruenasConf:
+    def __init__(self, root = "/") -> None:
+        self.root = Path(root)
+        pass
+    
+    def run_sql(self, sql:str):
+        if sql:
+            return Root(self.root).run(Command("sqlite3", FREENAS_DB), input=sql)
+
+    def db(self):
+        return TruenasDB(self.root/FREENAS_DB)
+
+    def user_services(self)->'dict[str,bool]':
+        _path  = (self.root/ USER_SERVICES)
+        if _path.exists():
+            return json.loads(_path.read_text())
+        else:
+            return {}
+
+    def configure_user_service(self, service:str, enable:bool):
+        services = self.user_services()
+        services[service] = enable
+        (self.root/ USER_SERVICES).write_text(json.dumps(services))
+
+    def configure_serial_port(self):
+        advanced = self.db().query("system_advanced", prefix="adv_")
+        if advanced["serialconsole"]:
+            Root(self.root).run(
+                Command(
+                    "systemctl", "enable", f"serial-getty@{advanced['serialport']}.service"
+                ),
+                check=False,
+            )
+
+    def enable_services(self):
+        self.configure_serial_port()
+        systemd_units = [
+            srv
+            for srv, enabled in self.user_services().items()
+            if enabled
+        ]
+
+        if systemd_units:
+            Root(self.root).run(Command("systemctl", "enable", *systemd_units), check=False)
+
+
+def dict_factory(cursor: sqlite3.Cursor, row: "dict[str,str]"):
+    d: "dict[str,str]" = {}
     for idx, col in enumerate(cursor.description):
         d[col[0]] = row[idx]
     return d
-
-
-def query_config_table(table, database_path, prefix=None):
-    database_path = database_path
-    conn = sqlite3.connect(database_path)
-    try:
-        conn.row_factory = dict_factory
-        c = conn.cursor()
-        try:
-            c.execute(f"SELECT * FROM {table}")
-            result: "dict[str,str]" = c.fetchone()
-        finally:
-            c.close()
-    finally:
-        conn.close()
-    if prefix:
-        result = {k.replace(prefix, ""): v for k, v in result.items()}
-    return result
-
-
-def enable_system_user_services(root: Path, old_root: Path):
-    configure_serial_port(root, Path(old_root) / FREENAS_DB)
-    enable_user_services(root, old_root)
-
-
-def configure_serial_port(root: Path, db_path: Path):
-    if not db_path.exists():
-        return
-
-    # We would like to explicitly enable/disable serial-getty in the new BE based on db configuration
-    advanced = query_config_table("system_advanced", db_path, prefix="adv_")
-    if advanced["serialconsole"]:
-        Root(root).run(
-            Command(
-                "systemctl", "enable", f"serial-getty@{advanced['serialport']}.service"
-            ),
-            check=False,
-        )
-
-
-def enable_user_services(root: Path, old_root: Path):
-    user_services_file = Path(old_root) / USER_SERVICES
-    if not user_services_file.exists():
-        return
-
-    systemd_units = [
-        srv
-        for srv, enabled in json.loads(user_services_file.read_text()).items()
-        if enabled
-    ]
-
-    if systemd_units:
-        Root(root).run(Command("systemctl", "enable", *systemd_units), check=False)

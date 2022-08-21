@@ -1,5 +1,6 @@
+from os import chroot
 from tabnanny import check
-from typing import Type, TypeVar
+from typing import Type, TypeVar, overload
 from pathlib import Path
 
 from .utils import Command, Root
@@ -14,8 +15,13 @@ class ZfsContainer:
     def __init__(self, name: str, mgmt_cmd: Command) -> None:
         self.name = name
         self.mgmt_cmd = mgmt_cmd
-
-    def get_prop(self, prop: str, ctr: "Type[T]" = None):
+    @overload
+    def get_prop(self, prop: str) -> str:
+        pass
+    @overload
+    def get_prop(self, prop: str, ctr: "Type[T]") -> 'T|None':
+        pass
+    def get_prop(self, prop: str, ctr: "Type[T]" = None) -> 'str|T|None':
         value = (
             self.mgmt_cmd.with_args("get", H=None, o="value", p=prop, _=self.name)
             .run()
@@ -39,6 +45,7 @@ def zfs(*args, **kwargs):
 
 class Dataset(ZfsContainer):
     def __init__(self, name: "str|list[str]") -> None:
+        self.chroot:Root = Root("/")
         super().__init__("/".join(name if isinstance(name, list) else [name]), ZFS_CMD)
 
     def create(self, _auto=True, _runprops: dict = {}, /, **props):
@@ -57,33 +64,27 @@ class Dataset(ZfsContainer):
         return path
 
     def mount(self, path: Path = None):
-        if not path:
-            path = self._mntpoint()
+        orig_mntpoint = self._mntpoint()
+        mountpoint = Path(path or f"/mnt/{self.name}")
 
-        mnt = Mount(path or f"/mnt/{self.name}", "zfs", {})
-        mnt.unmount(check=False)
-        self.set_props(mountpoint="legacy")
-        return mnt
+        if mountpoint != orig_mntpoint:
+            self.set_props(mountpoint=mountpoint, orig_mountpoint=orig_mntpoint)
+        self.chroot.run(zfs("mount", self.name))
+        return (self.chroot, mountpoint)
 
-    def unmount(self, path: Path or None, mountpoint: "str" = None, check = True):
-        if not path:
-            path = self._mntpoint()
-        mnt = Mount(path or f"/mnt/{self.name}", "zfs", {})
-        mnt.unmount(check = check)
-        if mountpoint:
-            self.set_props(mountpoint=mountpoint)
-
+    def unmount(self, check = True):
+        self.chroot.run(zfs("unmount", self.name), check=check)
+        orig_mntpoint = self.get_prop("orig_mountpoint", str)
+        if orig_mntpoint:
+            self.set_props(orig_mntpoint="", mountpoint=orig_mntpoint)
+        
     def __enter__(self):
-        self._mntpoint = self._mntpoint()
-        self._mnt = self.mount()
-        return self._mnt
+        return self.mount()
 
     def __exit__(self, exept_type, exept_value, traceback):
-        if self._mnt.path.is_mount():
-            self.unmount(self._mnt.path, self._mntpoint, check=False)
-        del self._mnt
-        del self._mntpoint
-
+        path = self._mntpoint()
+        if path and path != "legacy" and Path(path).is_mount():
+            self.unmount(check=False)
 
 from typing import Type, TypeVar
 

@@ -32,7 +32,7 @@ class Logger:
             sys.stdout.write(f"[{int(progress * 100)}%] {message}\n")
         sys.stdout.flush()
 
-    def error(self, error: str, raise_:'Type[Exception|bool]'=False):
+    def error(self, error: str, raise_: "Type[Exception|bool]" = False):
         if self.json:
             sys.stdout.write(json.dumps({"error": error}) + "\n")
         else:
@@ -42,7 +42,6 @@ class Logger:
         if raise_:
             ctr = Exception if raise_ is True else raise_
             raise ctr(error)
-
 
 
 def run_command(
@@ -117,8 +116,19 @@ class Command:
         stderr=subprocess.PIPE,
         encoding="utf-8",
         errors="ignore",
+        chroot: "Root" = None,
         **kwargs,
-    ):
+    ) -> "subprocess.CompletedProcess[str]":
+        if chroot:
+            return chroot.run(
+                self.cmd,
+                check=check,
+                stdout=stdout,
+                stderr=stderr,
+                encoding=encoding,
+                errors=errors,
+                **kwargs,
+            )
         return run_command(self.cmd, check, stdout, stderr, encoding, errors, **kwargs)
 
 
@@ -159,8 +169,8 @@ class Root:
         self.path = Path(root)
 
     def cmd(self, cmd: Command):
-        troot = self.path.__str__() if self.path is not None else ""
-        if troot.strip() != "":
+        troot = self.path.__str__() if self.path is not None else "/"
+        if troot.strip() != "/":
             return Command("chroot", self.path, *cmd.cmd)
         else:
             return cmd
